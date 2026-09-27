@@ -1,0 +1,148 @@
+name: redox-idrr-source-excluded-portal
+
+on:
+  push:
+    branches:
+      - redox-idrr-extract-20260927
+
+permissions:
+  contents: read
+
+jobs:
+  recompute:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Checkout pinned official idrrR
+        uses: actions/checkout@v4
+        with:
+          repository: kris-nader/idrrR
+          ref: 4f41bf071a3dced4ccd7b41259da322fbb05a069
+          path: idrrR
+      - uses: r-lib/actions/setup-r@v2
+        with:
+          use-public-rspm: true
+      - uses: r-lib/actions/setup-r-dependencies@v2
+        with:
+          working-directory: idrrR
+          cache-version: 1
+
+      - name: Download official portal text inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -L --fail --retry 5 --retry-delay 2 -o /tmp/iDRR_metrics.csv \
+            https://aittokallio.group/iDRR/download/iDRR_metrics.csv
+          curl -L --fail --retry 5 --retry-delay 2 -o /tmp/iDRR_dose_response.tsv.gz \
+            https://aittokallio.group/iDRR/download/iDRR_dose_response.tsv.gz
+          sha256sum /tmp/iDRR_metrics.csv /tmp/iDRR_dose_response.tsv.gz > /tmp/input_sha256.txt
+
+      - name: Strict source-excluded official recomputation
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p redox_source_excluded_portal
+          cp idrrR/R/metrics.R /tmp/metrics_noplot.R
+          python - <<'PY'
+          p='/tmp/metrics_noplot.R'
+          s=open(p,encoding='utf-8').read()
+          needle='  IC50_dataframe[, numeric_cols] <- round(IC50_dataframe[, numeric_cols], 2)\n'
+          assert needle in s
+          s=s.replace(needle, needle+'  return(IC50_dataframe)\n',1)
+          open(p,'w',encoding='utf-8').write(s)
+          PY
+          cat > /tmp/recompute_portal.R <<'RS'
+          suppressPackageStartupMessages({
+            library(data.table); library(drc); library(minpack.lm); library(dplyr); library(ggplot2)
+          })
+          source("idrrR/R/dss_library.R")
+          source("/tmp/metrics_noplot.R")
+          norm <- function(x) gsub("[^[:alnum:]]", "", toupper(x))
+
+          metrics <- fread("/tmp/iDRR_metrics.csv", na.strings="NA")
+          if (nrow(metrics) != 195313L) stop(paste("metrics row mismatch",nrow(metrics)))
+          metrics[, drug_key := norm(drug)]
+          metrics[, cell_key := norm(cell)]
+          em <- metrics[drug_key=="ERASTIN"]
+          em[, ds_after := vapply(strsplit(datasets,";",fixed=TRUE), function(z) sum(tolower(trimws(z))!="ctrpv2"), integer(1))]
+          elig <- em[grepl("CTRPv2",datasets,fixed=TRUE) & ds_after>=2]
+          if (nrow(elig)!=54L) stop(paste("eligible mismatch",nrow(elig)))
+
+          raw <- fread("/tmp/iDRR_dose_response.tsv.gz", sep="\t", na.strings="NA", strip.white=FALSE,
+                      select=c("treatmentid","sampleid","dose","viability","dataset","DD"))
+          raw[, drug_key := norm(treatmentid)]
+          raw[, cell_key := norm(sampleid)]
+          er <- raw[drug_key=="ERASTIN" & cell_key %in% elig$cell_key & tolower(dataset)!="ctrpv2"]
+
+          ds_all <- sort(unique(as.character(er$dataset)))
+          if (!setequal(ds_all,c("gCSI","PRISM"))) stop(paste("unexpected datasets",paste(ds_all,collapse=";")))
+
+          out <- list(); failures <- list()
+          for (i in seq_len(nrow(elig))) {
+            ck <- elig$cell_key[i]
+            x <- er[cell_key==ck]
+            ds <- sort(unique(as.character(x$dataset)))
+            if (!setequal(ds,c("gCSI","PRISM"))) {
+              failures[[length(failures)+1]] <- list(cell_key=ck,reason="dataset_set",datasets=paste(ds,collapse=";"))
+              next
+            }
+            dd <- unique(as.character(x$DD))
+            if (length(dd)!=1L) {
+              failures[[length(failures)+1]] <- list(cell_key=ck,reason="DD_not_unique",n_DD=length(dd))
+              next
+            }
+            med <- x[,.(med_viability=median(viability,na.rm=TRUE)),by=.(DD,dataset,dose)]
+            setorder(med,dataset,dose)
+            dc <- med[,.N,by=dataset]
+            if (any(dc$N<2L)) {
+              failures[[length(failures)+1]] <- list(cell_key=ck,reason="dataset_lt2_doses")
+              next
+            }
+            ans <- tryCatch(calculate_all(dose=med$dose,
+                                          inhibition_percent=100-med$med_viability,
+                                          dataset=med$dataset,
+                                          drug_name=med$DD[1]),
+                            error=function(e)e)
+            if (inherits(ans,"error")) {
+              failures[[length(failures)+1]] <- list(cell_key=ck,reason="fit_error",message=conditionMessage(ans))
+              next
+            }
+            out[[length(out)+1]] <- data.frame(
+              cell_key=ck,cell=elig$cell[i],SEE_full=elig$SEE[i],
+              n_datasets_full=elig$n_datasets[i],
+              source_excluded_SEE=as.numeric(ans$SE_of_estimate[1]),
+              source_excluded_IC50=as.numeric(ans$IC50[1]),
+              source_excluded_DRS=as.numeric(ans$DRS[1]),
+              n_raw_rows=nrow(x),n_median_dose_points=nrow(med),
+              gCSI_dose_points=dc[dataset=="gCSI",N],
+              PRISM_dose_points=dc[dataset=="PRISM",N],
+              stringsAsFactors=FALSE)
+          }
+          ok <- rbindlist(out,fill=TRUE)
+          fwrite(ok,"redox_source_excluded_portal/erastin_source_excluded_see.csv")
+          fwrite(elig[,.(cell,cell_key,SEE,n_datasets,datasets)],"redox_source_excluded_portal/eligible54_from_metrics.csv")
+          fwrite(er[,.N,by=.(cell_key,dataset)][order(cell_key,dataset)],"redox_source_excluded_portal/raw_rows_per_pair_dataset.csv")
+          file.copy("/tmp/input_sha256.txt","redox_source_excluded_portal/input_sha256.txt")
+          audit <- data.frame(
+            key=c("idrrR_commit","eligible_pairs","raw_erastin_rows_after_source_exclusion",
+                  "source_dropped","remaining_datasets","successful_fits","failed_fits","plotting_patch"),
+            value=c("4f41bf071a3dced4ccd7b41259da322fbb05a069",nrow(elig),nrow(er),
+                    "CTRPv2",paste(ds_all,collapse=";"),nrow(ok),length(failures),
+                    "return after official rounded IC50_dataframe; no numerical edits")
+          )
+          fwrite(audit,"redox_source_excluded_portal/recompute_audit.csv")
+          if (length(failures)>0) {
+            writeLines(capture.output(str(failures)),"redox_source_excluded_portal/failures.txt")
+          }
+          if (nrow(ok)<40L) stop(paste("Too few successful fits",nrow(ok)))
+          print(audit)
+          RS
+          Rscript /tmp/recompute_portal.R
+
+      - name: Upload strict source-excluded results
+        uses: actions/upload-artifact@v4
+        with:
+          name: redox-idrr-source-excluded-portal
+          path: redox_source_excluded_portal/
+          if-no-files-found: error
+          retention-days: 1
