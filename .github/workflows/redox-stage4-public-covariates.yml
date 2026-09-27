@@ -1,0 +1,41 @@
+name: redox-stage4-public-covariates
+on:
+  push:
+    branches: [redox-upgrade-public-evidence-20260927]
+    paths: ['.github/workflows/redox-stage4-public-covariates.yml']
+permissions:
+  contents: read
+jobs:
+  download:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Download public numeric covariates
+        shell: bash
+        run: |
+          mkdir -p public_covariates
+          python - <<'PY'
+          import urllib.request, pathlib, hashlib, json, datetime
+          p=pathlib.Path('public_covariates'); receipt=[]
+          urls={
+          'GSE115389_expression.txt.gz':'https://ftp.ncbi.nlm.nih.gov/geo/series/GSE115nnn/GSE115389/suppl/GSE115389_Normalized_RNASeq_Counts_786O_HIF2a_responsive_genes.txt.gz',
+          'GSE126696_guides.csv.gz':'https://ftp.ncbi.nlm.nih.gov/geo/series/GSE126nnn/GSE126696/suppl/GSE126696_CP0041_reference_20160112.csv.gz',
+          'GSE126696_counts.txt.gz':'https://ftp.ncbi.nlm.nih.gov/geo/series/GSE126nnn/GSE126696/suppl/GSE126696_scores_read_count_matrix_786O_ML210_time_course.txt.gz',
+          'GSE228883_counts.txt.gz':'https://ftp.ncbi.nlm.nih.gov/geo/series/GSE228nnn/GSE228883/suppl/GSE228883_Huh7RSL3.count.txt.gz'}
+          for name,url in urls.items():
+              try:
+                  with urllib.request.urlopen(url,timeout=40) as f: data=f.read(8*1024*1024+1)
+                  if len(data)>8*1024*1024:raise RuntimeError('budget exceeded')
+                  if data[:2]!=b'\x1f\x8b':raise RuntimeError('not gzip')
+                  (p/name).write_bytes(data)
+                  receipt.append(dict(name=name,url=url,sha256=hashlib.sha256(data).hexdigest(),bytes=len(data),status='ok'))
+              except Exception as e:receipt.append(dict(name=name,url=url,status='failed',error=str(e)))
+          (p/'receipt.json').write_text(json.dumps({'utc':datetime.datetime.now(datetime.timezone.utc).isoformat(),'files':receipt},indent=2))
+          print(json.dumps(receipt,indent=2))
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: redox-stage4-public-covariates
+          path: public_covariates/
+          if-no-files-found: error
+          retention-days: 7
