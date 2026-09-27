@@ -64,13 +64,13 @@ jobs:
                                    'datasets':row['datasets'],'SEE_full':row['SEE'],
                                    'n_datasets_full':row['n_datasets']})
           assert total==195313, total
-          assert len(elig)==54, len(elig)
+          assert len(elig)==113, len(elig)
           with open('/tmp/eligible54.csv','w',encoding='utf-8',newline='') as f:
               w=csv.DictWriter(f,fieldnames=elig[0].keys()); w.writeheader(); w.writerows(elig)
           with open('/tmp/eligibility_audit.json','w') as f:
-              json.dump({'metrics_total_rows':total,'eligible_pairs':len(elig),
+              json.dump({'metrics_total_rows':total,'eligible_all_pairs':len(elig),
                          'rule':'Erastin; CTRPv2 present; >=2 non-CTRPv2 datasets'},f,indent=2)
-          print(json.dumps({'metrics_total_rows':total,'eligible_pairs':len(elig)},indent=2))
+          print(json.dumps({'metrics_total_rows':total,'eligible_all_pairs':len(elig)},indent=2))
           PY
 
       - name: Patch plotting only and recompute gCSI+PRISM SEE
