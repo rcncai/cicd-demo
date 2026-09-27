@@ -36,6 +36,7 @@ jobs:
           curl -L --fail --retry 5 --retry-delay 2 -o /tmp/iDRR_dose_response.tsv.gz \
             https://aittokallio.group/iDRR/download/iDRR_dose_response.tsv.gz
           sha256sum /tmp/iDRR_metrics.csv /tmp/iDRR_dose_response.tsv.gz > /tmp/input_sha256.txt
+          gunzip -c /tmp/iDRR_dose_response.tsv.gz > /tmp/iDRR_dose_response.tsv
 
       - name: Refit all source-excludable Erastin pairs
         shell: bash
