@@ -1,0 +1,79 @@
+name: redox-idrr-extract
+
+on:
+  push:
+    branches:
+      - redox-idrr-extract-20260927
+
+permissions:
+  contents: read
+
+jobs:
+  extract:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download and filter iDRR metrics
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p redox_idrr_artifact
+          curl -L --fail --retry 5 --retry-delay 2 \
+            -o /tmp/iDRR_metrics.csv \
+            https://aittokallio.group/iDRR/download/iDRR_metrics.csv
+          python - <<'PY'
+          import csv, hashlib, json, os, re
+          src = "/tmp/iDRR_metrics.csv"
+          out = "redox_idrr_artifact/idrr_ferroptosis_metrics.csv"
+          audit = "redox_idrr_artifact/idrr_ferroptosis_audit.json"
+          targets = {"ERASTIN","ML162","ML210","RSL3"}
+          def norm(x):
+              return re.sub(r"[^A-Z0-9]+","",str(x).upper())
+          total = 0
+          matched = 0
+          counts = {}
+          names = {}
+          with open(src, "r", encoding="utf-8-sig", newline="") as fin:
+              reader = csv.DictReader(fin)
+              if not reader.fieldnames:
+                  raise RuntimeError("missing CSV header")
+              required = {"drug","cell","SEE","n_datasets","datasets"}
+              miss = sorted(required - set(reader.fieldnames))
+              if miss:
+                  raise RuntimeError(f"missing required columns: {miss}")
+              with open(out, "w", encoding="utf-8", newline="") as fout:
+                  writer = csv.DictWriter(fout, fieldnames=reader.fieldnames)
+                  writer.writeheader()
+                  for row in reader:
+                      total += 1
+                      k = norm(row.get("drug",""))
+                      if k in targets:
+                          writer.writerow(row)
+                          matched += 1
+                          counts[k] = counts.get(k,0)+1
+                          names.setdefault(k,set()).add(row.get("drug",""))
+          sha = hashlib.sha256(open(src,"rb").read()).hexdigest()
+          payload = {
+              "source_url":"https://aittokallio.group/iDRR/download/iDRR_metrics.csv",
+              "source_sha256":sha,
+              "total_rows":total,
+              "matched_rows":matched,
+              "counts_by_normalized_drug":counts,
+              "raw_names":{k:sorted(v) for k,v in names.items()},
+              "required_columns":["drug","cell","SEE","n_datasets","datasets"]
+          }
+          with open(audit,"w",encoding="utf-8") as f:
+              json.dump(payload,f,indent=2,sort_keys=True)
+          print(json.dumps(payload,indent=2,sort_keys=True))
+          if total != 195313:
+              raise RuntimeError(f"unexpected metrics row count: {total}")
+          if matched == 0:
+              raise RuntimeError("no target drugs matched")
+          PY
+      - name: Upload filtered iDRR subset
+        uses: actions/upload-artifact@v4
+        with:
+          name: redox-idrr-ferroptosis-subset
+          path: redox_idrr_artifact/
+          if-no-files-found: error
+          retention-days: 1
