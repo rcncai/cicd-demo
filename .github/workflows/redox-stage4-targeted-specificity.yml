@@ -1,0 +1,37 @@
+name: redox-stage4-targeted-specificity
+on:
+  push:
+    branches: [redox-upgrade-public-evidence-20260927]
+    paths: ['.github/workflows/redox-stage4-targeted-specificity.yml']
+permissions:
+  contents: read
+jobs:
+  download:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Retrieve published supplementary workbook
+        shell: bash
+        run: |
+          mkdir -p targeted_specificity
+          python - <<'PY'
+          import urllib.request, pathlib, hashlib, json, datetime, zipfile
+          p=pathlib.Path('targeted_specificity')
+          u='https://media.springernature.com/original/springer-static/esm/art%3A10.1038%2Fs41556-025-01856-x/MediaObjects/41556_2025_1856_MOESM19_ESM.xlsx'
+          rec=dict(url=u,utc=datetime.datetime.now(datetime.timezone.utc).isoformat())
+          try:
+              with urllib.request.urlopen(u,timeout=90) as f:data=f.read(64*1024*1024+1)
+              if len(data)>64*1024*1024:raise ValueError('size exceeds bounded download')
+              fp=p/'riboflavin_extended2.xlsx';fp.write_bytes(data)
+              with zipfile.ZipFile(fp) as z:
+                  assert 'xl/workbook.xml' in z.namelist()
+              rec.update(status='ok',bytes=len(data),sha256=hashlib.sha256(data).hexdigest())
+          except Exception as e:rec.update(status='failed',error=str(e))
+          (p/'receipt.json').write_text(json.dumps(rec,indent=2));print(json.dumps(rec,indent=2))
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: redox-stage4-targeted-specificity
+          path: targeted_specificity/
+          retention-days: 7
+          if-no-files-found: error
