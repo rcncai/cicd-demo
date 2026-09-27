@@ -1,0 +1,51 @@
+name: redox-ctd2-source
+
+on:
+  push:
+    branches:
+      - redox-idrr-extract-20260927
+
+permissions:
+  contents: read
+
+jobs:
+  restore:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Restore frozen CTD2 source table
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p redox_ctd2_artifact
+          curl -L --fail --retry 5 --retry-delay 2 \
+            -o redox_ctd2_artifact/ferroptosis_response_long.csv \
+            https://raw.githubusercontent.com/Li-Hongmin/ferro-arch/3ba91516e01b20873cfe6554f5e9a0617ba7d094/analysis/results/ferroptosis_response_long.csv
+          python - <<'PY'
+          import hashlib, json
+          p="redox_ctd2_artifact/ferroptosis_response_long.csv"
+          data=open(p,"rb").read()
+          blob=hashlib.sha1(b"blob "+str(len(data)).encode()+b"\0"+data).hexdigest()
+          audit={
+            "source_url":"https://raw.githubusercontent.com/Li-Hongmin/ferro-arch/3ba91516e01b20873cfe6554f5e9a0617ba7d094/analysis/results/ferroptosis_response_long.csv",
+            "commit":"3ba91516e01b20873cfe6554f5e9a0617ba7d094",
+            "bytes":len(data),
+            "git_blob_sha1":blob,
+            "sha256":hashlib.sha256(data).hexdigest(),
+            "expected_bytes":657372,
+            "expected_git_blob_sha1":"1d21a2359c61120f8e733855514c6e702cd3823f"
+          }
+          if audit["bytes"] != audit["expected_bytes"]:
+              raise RuntimeError(f"size mismatch {audit['bytes']}")
+          if audit["git_blob_sha1"] != audit["expected_git_blob_sha1"]:
+              raise RuntimeError(f"blob mismatch {audit['git_blob_sha1']}")
+          open("redox_ctd2_artifact/ctd2_source_audit.json","w").write(json.dumps(audit,indent=2,sort_keys=True))
+          print(json.dumps(audit,indent=2,sort_keys=True))
+          PY
+      - name: Upload frozen CTD2 source
+        uses: actions/upload-artifact@v4
+        with:
+          name: redox-ctd2-frozen-source
+          path: redox_ctd2_artifact/
+          if-no-files-found: error
+          retention-days: 1
