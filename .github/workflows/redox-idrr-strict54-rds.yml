@@ -1,0 +1,59 @@
+name: redox-idrr-strict54-rds
+
+on:
+  push:
+    branches:
+      - redox-idrr-subset-20260927
+
+permissions:
+  contents: read
+
+jobs:
+  extract:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: r-lib/actions/setup-r@v2
+      - name: Extract strict 54 from official Zenodo RDS
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p redox_strict54_rds
+          curl -L --fail --retry 5 --retry-delay 2 \
+            -o /tmp/iDRR_raw_data.rds \
+            "https://zenodo.org/records/18775863/files/iDRR_raw_data.rds?download=1"
+          md5sum /tmp/iDRR_raw_data.rds > redox_strict54_rds/input_md5.txt
+          sha256sum /tmp/iDRR_raw_data.rds > redox_strict54_rds/input_sha256.txt
+          Rscript - <<'RS'
+          norm <- function(z) gsub("[^[:alnum:]]","",toupper(as.character(z)))
+          keys <- read.csv("redox_audit/STRICT_54_CELL_KEYS.csv", stringsAsFactors=FALSE)$cell_key
+          x <- readRDS("/tmp/iDRR_raw_data.rds")
+          er <- x[norm(x$treatmentid)=="ERASTIN" &
+                  norm(x$sampleid) %in% keys &
+                  tolower(as.character(x$dataset))!="ctrpv2", , drop=FALSE]
+          er$cell_key <- norm(er$sampleid)
+          present <- sort(unique(er$cell_key))
+          ds <- sort(unique(as.character(er$dataset)))
+          if (!identical(present,sort(keys))) stop(paste("missing cells",paste(setdiff(keys,present),collapse=";")))
+          if (!setequal(ds,c("gCSI","PRISM"))) stop(paste("unexpected datasets",paste(ds,collapse=";")))
+          write.csv(er,"redox_strict54_rds/erastin_strict54_nonCTRP.csv",row.names=FALSE,quote=TRUE)
+          tab <- as.data.frame(table(er$cell_key,er$dataset),stringsAsFactors=FALSE)
+          names(tab) <- c("cell_key","dataset","n_raw_rows")
+          tab <- tab[tab$n_raw_rows>0,]
+          write.csv(tab,"redox_strict54_rds/cell_dataset_counts.csv",row.names=FALSE)
+          audit <- c(
+            paste0("raw_total_rows=",nrow(x)),
+            paste0("strict54_nonCTRP_rows=",nrow(er)),
+            paste0("strict54_cells_present=",length(present)),
+            paste0("datasets=",paste(ds,collapse=";"))
+          )
+          writeLines(audit,"redox_strict54_rds/audit.txt")
+          print(audit)
+          RS
+      - name: Upload strict54 RDS subset
+        uses: actions/upload-artifact@v4
+        with:
+          name: redox-idrr-strict54-rds
+          path: redox_strict54_rds/
+          if-no-files-found: error
+          retention-days: 1
