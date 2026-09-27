@@ -102,6 +102,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          python -m pip install --quiet openpyxl
           python - <<'PY'
           import openpyxl, json, re, csv, os
           p="/tmp/supp2.xlsx"
