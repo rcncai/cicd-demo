@@ -50,6 +50,7 @@ jobs:
                   audit["metadata"].append({"url":url,"error":repr(e)})
           # likely direct URLs too
           direct=[
+            "https://www.ebi.ac.uk/biostudies/files/S-EPMC4792701/NIHMS753246-supplement-2.xlsx",
             "https://pmc.ncbi.nlm.nih.gov/articles/PMC4792701/bin/NIHMS753246-supplement-2.xlsx",
             "https://pmc.ncbi.nlm.nih.gov/articles/instance/4792701/bin/NIHMS753246-supplement-2.xlsx",
           ]
