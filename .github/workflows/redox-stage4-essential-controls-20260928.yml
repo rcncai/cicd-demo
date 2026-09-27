@@ -1,0 +1,35 @@
+name: redox-stage4-essential-controls-20260928
+on:
+  push:
+    branches: [redox-upgrade-public-evidence-20260927]
+    paths: ['.github/workflows/redox-stage4-essential-controls-20260928.yml']
+permissions:
+  contents: read
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: Retrieve public reference controls only
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p essential_controls
+          python - <<'PY'
+          import urllib.request,pathlib,hashlib,json,datetime
+          p=pathlib.Path('essential_controls');receipt=[]
+          commit='53388adbb4fb0931e5c9dda135502be19e4555f0'
+          for name in ['CEGv2.txt','NEGv1.txt','LICENSE']:
+              url=f'https://raw.githubusercontent.com/hart-lab/bagel/{commit}/{name}'
+              with urllib.request.urlopen(url,timeout=30) as f:data=f.read(100000)
+              (p/name).write_bytes(data)
+              receipt.append(dict(file=name,url=url,commit=commit,bytes=len(data),sha256=hashlib.sha256(data).hexdigest()))
+          (p/'receipt.json').write_text(json.dumps(dict(utc=datetime.datetime.now(datetime.timezone.utc).isoformat(),inputs=receipt),indent=2))
+          print(json.dumps(receipt,indent=2))
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: redox-stage4-essential-controls-20260928
+          path: essential_controls/
+          retention-days: 7
+          if-no-files-found: error
