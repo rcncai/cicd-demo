@@ -70,7 +70,7 @@ jobs:
           elig <- em[grepl("CTRPv2",datasets,fixed=TRUE) & ds_after>=2]
           if (nrow(elig)!=113L) stop(paste("eligible-all mismatch",nrow(elig)))
 
-          raw <- fread("/tmp/iDRR_dose_response.tsv.gz", sep="\t", na.strings="NA", strip.white=FALSE,
+          raw <- fread("/tmp/iDRR_dose_response.tsv", sep="\t", na.strings="NA", strip.white=FALSE,
                       select=c("treatmentid","sampleid","dose","viability","dataset","DD"))
           raw[, drug_key := norm(treatmentid)]
           raw[, cell_key := norm(sampleid)]
