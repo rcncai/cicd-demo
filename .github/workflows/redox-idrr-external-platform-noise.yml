@@ -1,0 +1,147 @@
+name: redox-idrr-external-platform-noise
+
+on:
+  push:
+    branches:
+      - redox-idrr-extract-20260927
+
+permissions:
+  contents: read
+
+jobs:
+  compute:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Checkout pinned official idrrR
+        uses: actions/checkout@v4
+        with:
+          repository: kris-nader/idrrR
+          ref: 4f41bf071a3dced4ccd7b41259da322fbb05a069
+          path: idrrR
+
+      - uses: r-lib/actions/setup-r@v2
+        with:
+          use-public-rspm: true
+
+      - uses: r-lib/actions/setup-r-dependencies@v2
+        with:
+          working-directory: idrrR
+          cache-version: 1
+
+      - name: Download pinned inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -L --fail --retry 5 --retry-delay 2 \
+            -o /tmp/iDRR_dose_response.tsv.gz \
+            https://aittokallio.group/iDRR/download/iDRR_dose_response.tsv.gz
+          gunzip -c /tmp/iDRR_dose_response.tsv.gz > /tmp/iDRR_dose_response.tsv
+          curl -L --fail --retry 5 --retry-delay 2 \
+            -o /tmp/ferroptosis_response_long.csv \
+            https://raw.githubusercontent.com/Li-Hongmin/ferro-arch/3ba91516e01b20873cfe6554f5e9a0617ba7d094/analysis/results/ferroptosis_response_long.csv
+          sha256sum /tmp/iDRR_dose_response.tsv.gz /tmp/ferroptosis_response_long.csv > /tmp/input_sha256.txt
+
+      - name: Compute source-independent PRISM and gCSI curve residual SEE
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p redox_external_platform_noise
+          cp idrrR/R/metrics.R /tmp/metrics_noplot.R
+          python - <<'PY'
+          p='/tmp/metrics_noplot.R'
+          s=open(p,encoding='utf-8').read()
+          needle='  IC50_dataframe[, numeric_cols] <- round(IC50_dataframe[, numeric_cols], 2)\n'
+          assert needle in s
+          s=s.replace(needle, needle+'  return(IC50_dataframe)\n',1)
+          open(p,'w',encoding='utf-8').write(s)
+          PY
+
+          cat > /tmp/external_noise.R <<'RS'
+          suppressPackageStartupMessages({
+            library(data.table); library(drc); library(minpack.lm); library(dplyr); library(ggplot2)
+          })
+          source("idrrR/R/dss_library.R")
+          source("/tmp/metrics_noplot.R")
+          norm <- function(x) gsub("[^[:alnum:]]","",toupper(as.character(x)))
+
+          resp <- fread("/tmp/ferroptosis_response_long.csv")
+          d <- resp[toupper(dataset)=="CTD2" & norm(drug)=="ERASTIN"]
+          a <- d[toupper(metric)=="AUC", .(ModelID, cell_a=CellLineName, lin_a=OncotreeLineage)]
+          i <- d[toupper(metric) %in% c("LOG2IC50","LOGIC50","IC50"), .(ModelID, cell_i=CellLineName, lin_i=OncotreeLineage)]
+          ctd <- merge(a,i,by="ModelID",all=FALSE)
+          ctd[, cell_line := fifelse(!is.na(cell_a) & cell_a!="", cell_a, cell_i)]
+          ctd[, cell_key := norm(cell_line)]
+          dupkeys <- unique(ctd[duplicated(cell_key) | duplicated(cell_key,fromLast=TRUE), cell_key])
+          ctd <- ctd[!cell_key %in% dupkeys]
+          target_keys <- unique(ctd$cell_key)
+
+          raw <- fread("/tmp/iDRR_dose_response.tsv", sep="\t", na.strings="NA", strip.white=FALSE,
+                      select=c("treatmentid","sampleid","dose","viability","dataset","DD"))
+          raw[, drug_key := norm(treatmentid)]
+          raw[, cell_key := norm(sampleid)]
+          er <- raw[drug_key=="ERASTIN" & cell_key %in% target_keys & dataset %in% c("PRISM","gCSI")]
+
+          groups <- unique(er[,.(cell_key,dataset)])
+          out <- list(); failures <- list()
+          for (j in seq_len(nrow(groups))) {
+            ck <- groups$cell_key[j]; ds <- groups$dataset[j]
+            x <- er[cell_key==ck & dataset==ds]
+            dd <- unique(as.character(x$DD))
+            if (length(dd)!=1L) {
+              failures[[length(failures)+1]] <- list(cell_key=ck,dataset=ds,reason="DD_not_unique")
+              next
+            }
+            med <- x[,.(med_viability=median(viability,na.rm=TRUE)),by=.(DD,dataset,dose)]
+            setorder(med,dose)
+            ans <- tryCatch(
+              calculate_all(dose=med$dose,
+                            inhibition_percent=100-med$med_viability,
+                            dataset=med$dataset,
+                            drug_name=med$DD[1]),
+              error=function(e)e
+            )
+            if (inherits(ans,"error")) {
+              failures[[length(failures)+1]] <- list(cell_key=ck,dataset=ds,reason="fit_error",message=conditionMessage(ans),n_points=nrow(med))
+              next
+            }
+            out[[length(out)+1]] <- data.frame(
+              cell_key=ck, dataset=ds,
+              external_SEE=as.numeric(ans$SE_of_estimate[1]),
+              external_IC50=as.numeric(ans$IC50[1]),
+              external_DRS=as.numeric(ans$DRS[1]),
+              n_raw_rows=nrow(x),
+              n_median_dose_points=nrow(med),
+              stringsAsFactors=FALSE
+            )
+          }
+          ok <- rbindlist(out,fill=TRUE)
+          fwrite(ok,"redox_external_platform_noise/erastin_external_platform_see.csv")
+          fwrite(er[,.N,by=.(cell_key,dataset)][order(dataset,cell_key)],
+                 "redox_external_platform_noise/raw_rows_per_pair_dataset.csv")
+          file.copy("/tmp/input_sha256.txt","redox_external_platform_noise/input_sha256.txt")
+          audit <- data.frame(
+            key=c("idrrR_commit","ctd2_target_keys","ctd2_ambiguous_keys_excluded",
+                  "candidate_external_pairs","successful_fits","failed_fits",
+                  "platforms","metric_definition","plotting_patch"),
+            value=c("4f41bf071a3dced4ccd7b41259da322fbb05a069",
+                    length(target_keys),length(dupkeys),nrow(groups),nrow(ok),length(failures),
+                    paste(sort(unique(er$dataset)),collapse=";"),
+                    "official calculate_all SE_of_estimate fitted separately within each external platform",
+                    "return after official rounded IC50_dataframe; no numerical edits")
+          )
+          fwrite(audit,"redox_external_platform_noise/audit.csv")
+          if (length(failures)>0) writeLines(capture.output(str(failures)),
+                    "redox_external_platform_noise/failures.txt")
+          print(audit)
+          RS
+          Rscript /tmp/external_noise.R
+
+      - name: Upload external platform results
+        uses: actions/upload-artifact@v4
+        with:
+          name: redox-idrr-external-platform-noise
+          path: redox_external_platform_noise/
+          if-no-files-found: error
+          retention-days: 1
