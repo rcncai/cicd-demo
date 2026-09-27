@@ -13,61 +13,115 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Fetch Shimada 2016 supplementary XLSX
+      - name: Resolve and fetch Shimada 2016 supplement
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p redox_nci60_supp
           python - <<'PY'
-          import urllib.request, urllib.error, os, json, re, zipfile, xml.etree.ElementTree as ET
-          urls=[
+          import urllib.request, urllib.parse, json, re, os, tarfile, io, gzip, hashlib, xml.etree.ElementTree as ET
+          UA={"User-Agent":"Mozilla/5.0 redox-research-audit"}
+          def get(url,timeout=120):
+              req=urllib.request.Request(url,headers=UA)
+              with urllib.request.urlopen(req,timeout=timeout) as r:
+                  return r.read(), r.geturl(), dict(r.headers)
+          audit={"metadata":[],"attempts":[]}
+          # 1) NCBI OA package resolver
+          package_urls=[]
+          for url in [
+              "https://www.ncbi.nlm.nih.gov/pmc/utils/oa/oa.fcgi?id=PMC4792701",
+              "https://www.ebi.ac.uk/europepmc/webservices/rest/PMC4792701/fullTextXML",
+              "https://www.ebi.ac.uk/biostudies/api/v1/studies/S-EPMC4792701",
+          ]:
+              try:
+                  b,final,h=get(url)
+                  txt=b.decode("utf-8","ignore")
+                  audit["metadata"].append({"url":url,"final":final,"bytes":len(b),"preview":txt[:5000]})
+                  for m in re.finditer(r'https?://[^\"\'<>\s]+',txt):
+                      u=m.group(0).replace("&amp;","&")
+                      if any(x in u.lower() for x in [".tar.gz",".xlsx","supplement"]):
+                          package_urls.append(u)
+                  # oa.fcgi often has ftp href
+                  for m in re.finditer(r'href=[\"\']([^\"\']+)[\"\']',txt):
+                      u=m.group(1).replace("&amp;","&")
+                      if any(x in u.lower() for x in [".tar.gz",".xlsx","supplement"]):
+                          package_urls.append(u)
+              except Exception as e:
+                  audit["metadata"].append({"url":url,"error":repr(e)})
+          # likely direct URLs too
+          direct=[
             "https://pmc.ncbi.nlm.nih.gov/articles/PMC4792701/bin/NIHMS753246-supplement-2.xlsx",
             "https://pmc.ncbi.nlm.nih.gov/articles/instance/4792701/bin/NIHMS753246-supplement-2.xlsx",
-            "https://www.ncbi.nlm.nih.gov/pmc/articles/PMC4792701/bin/NIHMS753246-supplement-2.xlsx",
           ]
+          candidates=[]
+          seen=set()
+          for u in package_urls+direct:
+              if u not in seen:
+                  seen.add(u); candidates.append(u)
           out="/tmp/supp2.xlsx"
-          log=[]
-          for u in urls:
+          found=False
+          for u in candidates:
               try:
-                  req=urllib.request.Request(u,headers={"User-Agent":"Mozilla/5.0"})
-                  with urllib.request.urlopen(req,timeout=90) as r:
-                      b=r.read()
-                  ok=b[:2]==b'PK'
-                  log.append({"url":u,"bytes":len(b),"xlsx_magic":ok})
-                  if ok and len(b)>10000:
-                      open(out,"wb").write(b); break
+                  b,final,h=get(u,180)
+                  rec={"url":u,"final":final,"bytes":len(b),"magic":b[:8].hex()}
+                  audit["attempts"].append(rec)
+                  if b[:2]==b"PK" and len(b)>10000:
+                      open(out,"wb").write(b); found=True; rec["selected"]="xlsx"; break
+                  # PMC OA package
+                  if (u.lower().endswith(".tar.gz") or b[:2]==b"\x1f\x8b") and len(b)>10000:
+                      try:
+                          tf=tarfile.open(fileobj=io.BytesIO(b),mode="r:gz")
+                          names=tf.getnames()
+                          rec["tar_members"]=names[:200]
+                          xs=[n for n in names if n.lower().endswith(".xlsx")]
+                          if xs:
+                              # prefer supplement-2 / largest xlsx
+                              scored=[]
+                              for n in xs:
+                                  info=tf.getmember(n)
+                                  score=(("supplement-2" in n.lower())*100000000 + info.size)
+                                  scored.append((score,n))
+                              n=max(scored)[1]
+                              data=tf.extractfile(n).read()
+                              open(out,"wb").write(data)
+                              rec["selected_tar_member"]=n
+                              found=True; break
+                      except Exception as e:
+                          rec["tar_error"]=repr(e)
               except Exception as e:
-                  log.append({"url":u,"error":repr(e)})
-          else:
-              raise SystemExit("No XLSX URL succeeded: "+json.dumps(log))
-          open("redox_nci60_supp/download_audit.json","w").write(json.dumps(log,indent=2))
-          import hashlib
+                  audit["attempts"].append({"url":u,"error":repr(e)})
+          open("redox_nci60_supp/resolution_audit.json","w",encoding="utf-8").write(json.dumps(audit,indent=2,ensure_ascii=False))
+          if not found:
+              raise SystemExit("Supplement XLSX unresolved; see metadata: "+json.dumps(audit)[:12000])
           b=open(out,"rb").read()
           open("redox_nci60_supp/input_sha256.txt","w").write(hashlib.sha256(b).hexdigest()+"  NIHMS753246-supplement-2.xlsx\n")
+          print("XLSX_BYTES",len(b),"SHA256",hashlib.sha256(b).hexdigest())
           PY
+      - name: Audit workbook and extract ferroptosis tables
+        shell: bash
+        run: |
+          set -euo pipefail
           python - <<'PY'
           import openpyxl, json, re, csv, os
           p="/tmp/supp2.xlsx"
           wb=openpyxl.load_workbook(p,data_only=True,read_only=True)
+          terms=["RSL3","ML162","ML210","ERASTIN","GI50","FERROPT"]
           audit={"sheets":{},"hits":[]}
-          terms=["RSL3","ML162","ML210","ERASTIN","GI50","NCI"]
           for ws in wb.worksheets:
               audit["sheets"][ws.title]={"max_row":ws.max_row,"max_column":ws.max_column}
               for row in ws.iter_rows():
                   vals=[c.value for c in row]
                   s=" | ".join("" if v is None else str(v) for v in vals)
                   if any(t.lower() in s.lower() for t in terms):
-                      audit["hits"].append({"sheet":ws.title,"row":row[0].row,"text":s[:3000]})
+                      audit["hits"].append({"sheet":ws.title,"row":row[0].row,"text":s[:5000]})
           with open("redox_nci60_supp/workbook_audit.json","w",encoding="utf-8") as f:
               json.dump(audit,f,indent=2,ensure_ascii=False)
-          print(json.dumps(audit,indent=2,ensure_ascii=False)[:30000])
-          # dump modest neighborhoods around hit rows for deterministic inspection
+          print(json.dumps(audit,indent=2,ensure_ascii=False)[:40000])
           for ws in wb.worksheets:
               hrs=sorted({h["row"] for h in audit["hits"] if h["sheet"]==ws.title})
               if not hrs: continue
               rows=set()
-              for r in hrs:
-                  rows.update(range(max(1,r-5),min(ws.max_row,r+5)+1))
+              for r in hrs: rows.update(range(max(1,r-8),min(ws.max_row,r+8)+1))
               out=f"redox_nci60_supp/{re.sub(r'[^A-Za-z0-9._-]+','_',ws.title)}_hit_neighborhood.tsv"
               with open(out,"w",encoding="utf-8",newline="") as f:
                   w=csv.writer(f,delimiter="\t")
