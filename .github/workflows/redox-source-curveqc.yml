@@ -1,0 +1,177 @@
+name: redox-source-curveqc
+
+on:
+  push:
+    branches:
+      - redox-source-curveqc-20260927
+
+permissions:
+  contents: read
+
+jobs:
+  compute:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Checkout pinned official idrrR
+        uses: actions/checkout@v4
+        with:
+          repository: kris-nader/idrrR
+          ref: 4f41bf071a3dced4ccd7b41259da322fbb05a069
+          path: idrrR
+      - uses: r-lib/actions/setup-r@v2
+        with:
+          use-public-rspm: true
+      - uses: r-lib/actions/setup-r-dependencies@v2
+        with:
+          working-directory: idrrR
+          cache-version: 1
+
+      - name: Download pinned inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -L --fail --retry 5 --retry-delay 2 \
+            -o /tmp/iDRR_raw_data.rds \
+            "https://zenodo.org/records/18775863/files/iDRR_raw_data.rds?download=1"
+          echo 'eecf2c858f789fcce7105e0823afc3ef  /tmp/iDRR_raw_data.rds' | md5sum -c -
+          curl -L --fail --retry 5 --retry-delay 2 \
+            -o /tmp/ferroptosis_response_long.csv \
+            https://raw.githubusercontent.com/Li-Hongmin/ferro-arch/3ba91516e01b20873cfe6554f5e9a0617ba7d094/analysis/results/ferroptosis_response_long.csv
+          sha256sum /tmp/ferroptosis_response_long.csv > /tmp/input_sha256.txt
+
+      - name: Compute source-only CTRPv2 curve QC features
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p redox_source_curveqc
+          cp idrrR/R/metrics.R /tmp/metrics_noplot.R
+          python - <<'PY'
+          p='/tmp/metrics_noplot.R'
+          s=open(p,encoding='utf-8').read()
+          needle='  IC50_dataframe[, numeric_cols] <- round(IC50_dataframe[, numeric_cols], 2)\n'
+          assert needle in s
+          s=s.replace(needle, needle+'  return(IC50_dataframe)\n',1)
+          open(p,'w',encoding='utf-8').write(s)
+          PY
+
+          cat > /tmp/run_curveqc.R <<'RS'
+          suppressPackageStartupMessages({
+            library(data.table); library(drc); library(minpack.lm); library(dplyr); library(ggplot2)
+          })
+          source("idrrR/R/dss_library.R")
+          source("/tmp/metrics_noplot.R")
+          norm <- function(x) gsub("[^[:alnum:]]","",toupper(as.character(x)))
+
+          resp <- fread("/tmp/ferroptosis_response_long.csv")
+          d <- resp[toupper(dataset)=="CTD2" & norm(drug)=="ERASTIN"]
+          a <- d[toupper(metric)=="AUC", .(ModelID, cell_a=CellLineName)]
+          i <- d[toupper(metric) %in% c("LOG2IC50","LOGIC50","IC50"), .(ModelID, cell_i=CellLineName)]
+          ctd <- merge(a,i,by="ModelID",all=FALSE)
+          ctd[, cell_line := fifelse(!is.na(cell_a) & cell_a!="",cell_a,cell_i)]
+          ctd[, cell_key := norm(cell_line)]
+          dupkeys <- unique(ctd[duplicated(cell_key) | duplicated(cell_key,fromLast=TRUE),cell_key])
+          target_keys <- unique(ctd[!cell_key %in% dupkeys,cell_key])
+
+          raw <- readRDS("/tmp/iDRR_raw_data.rds")
+          if (!is.data.table(raw)) setDT(raw)
+          raw[, drug_key := norm(treatmentid)]
+          raw[, cell_key := norm(sampleid)]
+          src <- raw[drug_key=="ERASTIN" & cell_key %in% target_keys & tolower(dataset)=="ctrpv2"]
+
+          keys <- sort(unique(src$cell_key))
+          out <- list(); failures <- list()
+          for (ck in keys) {
+            x <- src[cell_key==ck]
+            dd <- unique(as.character(x$DD))
+            if (length(dd)!=1L) {
+              failures[[length(failures)+1]] <- list(cell_key=ck,reason="DD_not_unique")
+              next
+            }
+
+            # Technical replicate dispersion before collapsing to one median per dose.
+            repstats <- x[, .(
+              n_rep=.N,
+              mad_viability=if (.N>1) median(abs(viability-median(viability,na.rm=TRUE)),na.rm=TRUE) else 0
+            ), by=dose]
+            replicate_mad <- median(repstats$mad_viability,na.rm=TRUE)
+            replicated_dose_fraction <- mean(repstats$n_rep>1)
+
+            med <- x[,.(med_viability=median(viability,na.rm=TRUE)),by=.(DD,dataset,dose)]
+            setorder(med,dose)
+            dv <- diff(med$med_viability)
+            mono_fraction <- if (length(dv)>0) mean(dv>0,na.rm=TRUE) else NA_real_
+            mono_positive_mean <- if (length(dv)>0) mean(pmax(dv,0),na.rm=TRUE) else NA_real_
+
+            ans <- tryCatch(
+              calculate_all(dose=med$dose,
+                            inhibition_percent=100-med$med_viability,
+                            dataset=med$dataset,
+                            drug_name=med$DD[1]),
+              error=function(e)e
+            )
+            if (inherits(ans,"error")) {
+              failures[[length(failures)+1]] <- list(cell_key=ck,reason="fit_error",
+                                                     message=conditionMessage(ans),n_points=nrow(med))
+              next
+            }
+
+            dmin <- min(med$dose,na.rm=TRUE); dmax <- max(med$dose,na.rm=TRUE)
+            span <- log10(dmax)-log10(dmin)
+            ic50 <- as.numeric(ans$IC50[1])
+            edge_risk <- NA_real_
+            if (is.finite(ic50) && ic50>0 && is.finite(span) && span>0) {
+              li <- log10(ic50); lo <- log10(dmin); hi <- log10(dmax)
+              edge_dist <- max(0,min(li-lo,hi-li))
+              edge_risk <- 1 - min(1, 2*edge_dist/span)
+            }
+
+            out[[length(out)+1]] <- data.frame(
+              cell_key=ck,
+              source_fit_SEE=as.numeric(ans$SE_of_estimate[1]),
+              source_IC50=ic50,
+              source_DRS=as.numeric(ans$DRS[1]),
+              source_slope=as.numeric(ans$SLOPE[1]),
+              source_max_response=as.numeric(ans$Max_Response[1]),
+              monotonicity_violation_fraction=mono_fraction,
+              monotonicity_positive_mean=mono_positive_mean,
+              edge_risk=edge_risk,
+              replicate_mad=replicate_mad,
+              replicated_dose_fraction=replicated_dose_fraction,
+              n_raw_rows=nrow(x),
+              n_dose_points=nrow(med),
+              dose_span_log10=span,
+              stringsAsFactors=FALSE
+            )
+          }
+
+          ok <- rbindlist(out,fill=TRUE)
+          fwrite(ok,"redox_source_curveqc/ctdpv2_erastin_curveqc_features.csv")
+          fwrite(src[,.N,by=.(cell_key,dose)][order(cell_key,dose)],
+                 "redox_source_curveqc/source_rows_per_cell_dose.csv")
+          file.copy("/tmp/input_sha256.txt","redox_source_curveqc/input_sha256.txt")
+          audit <- data.frame(
+            key=c("idrrR_commit","raw_rds_md5","ctd2_target_keys","ctd2_ambiguous_keys_excluded",
+                  "source_cells_candidate","successful_feature_rows","failed_rows","source_dataset",
+                  "feature_definition","plotting_patch"),
+            value=c("4f41bf071a3dced4ccd7b41259da322fbb05a069",
+                    unname(tools::md5sum("/tmp/iDRR_raw_data.rds")),
+                    length(target_keys),length(dupkeys),length(keys),nrow(ok),length(failures),
+                    "CTRPv2",
+                    "source-only: official fit SEE + monotonicity + IC50 edge risk + technical replicate dispersion + dose count/span",
+                    "return after official rounded IC50_dataframe; no numerical edits")
+          )
+          fwrite(audit,"redox_source_curveqc/audit.csv")
+          if (length(failures)>0) writeLines(capture.output(str(failures)),
+                    "redox_source_curveqc/failures.txt")
+          print(audit)
+          RS
+          Rscript /tmp/run_curveqc.R
+
+      - name: Upload result
+        uses: actions/upload-artifact@v4
+        with:
+          name: redox-source-curveqc
+          path: redox_source_curveqc/
+          if-no-files-found: error
+          retention-days: 1
