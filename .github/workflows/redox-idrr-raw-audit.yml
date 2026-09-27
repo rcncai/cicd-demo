@@ -1,0 +1,56 @@
+name: redox-idrr-raw-audit
+
+on:
+  push:
+    branches:
+      - redox-idrr-extract-20260927
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: r-lib/actions/setup-r@v2
+      - name: Download and audit iDRR raw RDS
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p redox_idrr_raw_audit
+          curl -L --fail --retry 5 --retry-delay 2 \
+            -o /tmp/iDRR_raw_data.rds \
+            "https://zenodo.org/records/18775863/files/iDRR_raw_data.rds?download=1"
+          Rscript - <<'RS'
+          x <- readRDS("/tmp/iDRR_raw_data.rds")
+          nms <- names(x)
+          norm <- function(z) gsub("[^[:alnum:]]", "", toupper(as.character(z)))
+          drug_col <- if ("DD" %in% nms) "DD" else if ("treatmentid" %in% nms) "treatmentid" else stop("no drug col")
+          cell_col <- if ("sampleid" %in% nms) "sampleid" else if ("cell" %in% nms) "cell" else stop("no cell col")
+          ds_col <- if ("dataset" %in% nms) "dataset" else stop("no dataset col")
+          er <- x[norm(x[[drug_col]]) == "ERASTIN", , drop=FALSE]
+          ds <- sort(unique(as.character(er[[ds_col]])))
+          out <- list(
+            n_rows=nrow(x),
+            n_cols=ncol(x),
+            columns=nms,
+            drug_col=drug_col,
+            cell_col=cell_col,
+            dataset_col=ds_col,
+            erastin_rows=nrow(er),
+            erastin_cells=length(unique(as.character(er[[cell_col]]))),
+            erastin_datasets=ds,
+            erastin_dataset_counts=as.list(table(as.character(er[[ds_col]])))
+          )
+          dput(out, file="redox_idrr_raw_audit/raw_audit.R")
+          writeLines(capture.output(str(out)), "redox_idrr_raw_audit/raw_audit.txt")
+          writeLines(ds, "redox_idrr_raw_audit/erastin_datasets.txt")
+          RS
+      - name: Upload raw audit
+        uses: actions/upload-artifact@v4
+        with:
+          name: redox-idrr-raw-audit
+          path: redox_idrr_raw_audit/
+          if-no-files-found: error
+          retention-days: 1
