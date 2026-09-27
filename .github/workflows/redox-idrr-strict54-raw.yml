@@ -1,0 +1,72 @@
+name: redox-idrr-strict54-raw
+
+on:
+  push:
+    branches:
+      - redox-idrr-subset-20260927
+
+permissions:
+  contents: read
+
+jobs:
+  extract:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download official iDRR raw text and extract strict 54
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p redox_strict54_raw
+          curl -L --fail --retry 5 --retry-delay 2 \
+            -o /tmp/iDRR_dose_response.tsv.gz \
+            https://aittokallio.group/iDRR/download/iDRR_dose_response.tsv.gz
+          sha256sum /tmp/iDRR_dose_response.tsv.gz > redox_strict54_raw/input_sha256.txt
+          python - <<'PY'
+          import csv,gzip,re,json,collections
+          def norm(x): return re.sub(r'[^A-Z0-9]+','',str(x).upper())
+          cells=set()
+          with open('redox_audit/STRICT_54_CELL_KEYS.csv',newline='',encoding='utf-8') as f:
+              for r in csv.DictReader(f): cells.add(r['cell_key'])
+          src='/tmp/iDRR_dose_response.tsv.gz'
+          out='redox_strict54_raw/erastin_strict54_raw.tsv.gz'
+          total=errows=kept=0
+          ds=collections.Counter(); percell=collections.Counter()
+          with gzip.open(src,'rt',encoding='utf-8-sig',newline='') as fin, gzip.open(out,'wt',encoding='utf-8',newline='') as fout:
+              rd=csv.DictReader(fin,delimiter='\t')
+              required={'treatmentid','sampleid','dose','viability','dataset','DD'}
+              miss=required-set(rd.fieldnames or [])
+              if miss: raise RuntimeError(f'missing columns {sorted(miss)}')
+              wr=csv.DictWriter(fout,fieldnames=rd.fieldnames,delimiter='\t')
+              wr.writeheader()
+              for row in rd:
+                  total+=1
+                  if norm(row['treatmentid'])!='ERASTIN': continue
+                  errows+=1
+                  ck=norm(row['sampleid'])
+                  if ck not in cells: continue
+                  if row['dataset'].strip().lower()=='ctrpv2': continue
+                  wr.writerow(row); kept+=1
+                  ds[row['dataset']]+=1; percell[(ck,row['dataset'])]+=1
+          present={k for k,d in percell}
+          audit={
+            'total_raw_rows':total,'all_erastin_rows':errows,
+            'strict54_nonCTRP_rows':kept,
+            'datasets':dict(ds),
+            'strict54_cells_requested':len(cells),
+            'strict54_cells_present':len(present),
+            'cells_missing':sorted(cells-present),
+            'cell_dataset_counts':{f'{c}|{d}':n for (c,d),n in sorted(percell.items())}
+          }
+          with open('redox_strict54_raw/audit.json','w') as f: json.dump(audit,f,indent=2,sort_keys=True)
+          print(json.dumps({k:v for k,v in audit.items() if k!='cell_dataset_counts'},indent=2))
+          if present != cells: raise RuntimeError(f'missing strict cells: {sorted(cells-present)}')
+          if set(ds) != {'gCSI','PRISM'}: raise RuntimeError(f'unexpected datasets: {sorted(ds)}')
+          PY
+      - name: Upload strict 54 raw subset
+        uses: actions/upload-artifact@v4
+        with:
+          name: redox-idrr-strict54-raw
+          path: redox_strict54_raw/
+          if-no-files-found: error
+          retention-days: 1
