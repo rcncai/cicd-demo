@@ -1,0 +1,29 @@
+name: redox-crispr-public-inputs
+on:
+  push:
+    branches: [redox-upgrade-public-evidence-20260927]
+    paths: ['.github/workflows/redox-crispr-public-inputs.yml']
+permissions:
+  contents: read
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fetch fixed CRISPR source files
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p crispr_inputs
+          curl -L --fail --retry 4 --retry-delay 2             -o crispr_inputs/zou2019_ML210.xlsx             'https://orcs.thebiogrid.org/uploads/processed/5f80bf9f0dc6b/41467_2019_9277_MOESM4_ESM%20%283%29.xlsx'
+          curl -L --fail --retry 4 --retry-delay 2             -o crispr_inputs/zou2020_RSL3.xlsx             'https://orcs.thebiogrid.org/uploads/processed/5f7cc8b1a0a67/41586_2020_2732_MOESM4_ESM.xlsx'
+          curl -L --fail --retry 4 --retry-delay 2             -o crispr_inputs/alborzinia2023_RSL3_Erastin.xlsx             'https://orcs.thebiogrid.org/uploads/processed/64c2dd393c070/emmm202318014-sup-0002-datasetev1.xlsx'
+          curl -L --fail --retry 4 --retry-delay 2             -o crispr_inputs/karasawa2024_Huh7_RSL3.gene_summary.txt.gz             'https://ftp.ncbi.nlm.nih.gov/geo/series/GSE228nnn/GSE228883/suppl/GSE228883_Huh7RSL3.gene_summary.txt.gz'
+          curl -L --fail --retry 4 --retry-delay 2             -o crispr_inputs/karasawa2024_Huh7_LA_RSL3.gene_summary.txt.gz             'https://ftp.ncbi.nlm.nih.gov/geo/series/GSE228nnn/GSE228883/suppl/GSE228883_Huh7LA%2BRSL3.gene_summary.txt.gz'
+          sha256sum crispr_inputs/* > crispr_inputs/SHA256SUMS.txt
+          ls -lh crispr_inputs
+      - uses: actions/upload-artifact@v4
+        with:
+          name: redox-crispr-public-inputs
+          path: crispr_inputs/
+          retention-days: 7
+          if-no-files-found: error
